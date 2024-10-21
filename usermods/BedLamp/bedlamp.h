@@ -104,9 +104,9 @@ class BedLampUsermod : public Usermod {
           color = BLACK;
         if (i >= 4 && i < 54 && !(fl||rd)) 
           color = BLACK;
-        if (i >= 54 && i < 104 && !(fl||rs||cs)) 
+        if (i >= 54 && i < 104 && !(fl||rs)) 
           color = BLACK;
-        if (i >= 104 && i < 108 && !(fl||rs)) 
+        if (i >= 104 && i < 108 && !(fl||rs||cs)) 
           color = BLACK;
 
         strip.setPixelColor(i, color);
