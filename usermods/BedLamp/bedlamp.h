@@ -8,7 +8,7 @@
 #define BTN_PIR_SX    2
 #define BTN_TOUCH_SX  3
 
-#define STA_LAMP_OFF    0x00
+#define STA_WLED_HANDLE 0x00
 #define STA_COURTESY_DX 0x01
 #define STA_COURTESY_SX 0x02
 #define STA_READING_DX  0x04
@@ -21,19 +21,30 @@
 #define WLED_DOUBLE_PRESS           350 // double press if another press within 350ms after a short press
 #define WLED_LONG_REPEATED_ACTION   100 // how often a repeated action (e.g. dimming) is fired 
 
-#define WLED_DEFAULT_BRIGHTNESS 128
+#define BRI_READING 128
+#define BRI_COURTESY 32
+#define BRI_FULL 128
+#define BRI_OFF 0
+
+#define BRI_MIN 8
+#define BRI_MAX 255
+
 #define ESP32_LED_BUILTIN 2
 
 class BedLampUsermod : public Usermod {
   private:
     bool enabled = false; //usermod is active
-    bool incontrol = false; //lamp controlled by this usermod now
-    uint32_t current_status = STA_LAMP_OFF;
-    unsigned long lastLoopTime = 0;
-    unsigned long lastFadeTime = 0;
-    unsigned long lastCommandTime = 0;
-    unsigned long originalTransitionDelay = 0;
-    uint8_t fade_up = 0;
+    uint32_t current_status = STA_WLED_HANDLE;
+    unsigned long lastLoopTime = 0; // used to make timed action in loop
+    unsigned long lastFadeTime = 0; // used to restore default fade direction after x sec from last effective fade, and to blinkblink
+    unsigned long lastStatusChangeTime = 0; //used to filter with a little delay to switch between WLED Handled and BEDLAMP Handled
+
+    unsigned long originalTransitionDelay = 0;  //used when changing brightness
+    uint8_t targetFadeBri = 0;
+
+    uint8_t fade_up = 1;
+    uint8_t do_blink_blink = 0;
+    
 
     // string that are used multiple time (this will save some flash memory)
     static const char _name[];
@@ -55,27 +66,23 @@ class BedLampUsermod : public Usermod {
       // NOTE: on very long strips strip.isUpdating() may always return true so update accordingly
       if (!enabled || strip.isUpdating()) return;
   
-      if (millis() - lastLoopTime > 10000) 
+      if (millis() - lastLoopTime > 1000) 
       {
         updateLocalTime();
         lastLoopTime = millis();
+        // uint16_t rawlight = analogRead(32); 
+        // Serial.printf("Light: %d\n", rawlight);
       }
 
-      if (millis() - lastFadeTime > 30000) //restore default fade direction after 30s
-        fade_up = 0;
-
-      if (originalTransitionDelay != 0 && (millis() - lastFadeTime) >= 2 * WLED_LONG_REPEATED_ACTION) //restore default transition delay after 1s
+      if (fade_up && millis() - lastFadeTime > 10000) 
       {
-        transitionDelay = originalTransitionDelay;
-        originalTransitionDelay = 0;
-        strip.setTransition(transitionDelay);
+        fade_up = 1; //restore default fade direction after 10s
       }
 
-      if (incontrol && strip.getBrightness() == 0 && (millis() - lastCommandTime > 1000)) //when turned off by this usermod or by WLED, detach control
+      if (current_status != STA_WLED_HANDLE && strip.getBrightness() == 0 && (millis() - lastStatusChangeTime > 1000)) //when turned off by this usermod or by WLED, detach control
       {
-         Serial.println("Now Handled by WLED");
-         current_status = STA_LAMP_OFF;
-         incontrol = false;
+        SetStatus(STA_WLED_HANDLE, 0, 0); //set as controlled by WLED
+        fade_up = 1; //restore default fade direction when turned off
       }
     }
 
@@ -87,7 +94,7 @@ class BedLampUsermod : public Usermod {
     void handleOverlayDraw() 
     {
       if (!enabled) return;
-      if (!incontrol) return;
+      if (current_status == STA_WLED_HANDLE) return;
 
       bool fl = TestBit(current_status, STA_FULL_LAMP);
       bool rd = TestBit(current_status, STA_READING_DX);
@@ -95,18 +102,25 @@ class BedLampUsermod : public Usermod {
       bool cd = TestBit(current_status, STA_COURTESY_DX);
       bool cs = TestBit(current_status, STA_COURTESY_SX);
 
+      if (do_blink_blink)
+      {
+        do_blink_blink = 1 + ((millis() - lastFadeTime) / 50); // compute the blink-blink state
+        if (do_blink_blink >= 5) do_blink_blink = 0; // end of blink-blink
+      } 
 
       for (int i = 0; i < striplenght; i++)
       {
         uint32_t color = COLOR_WARMWHITE;
 
-        if (i >= 0 && i < 4 && !(fl||rd||cd)) 
+        if (i >= 0 && i < 2 && !(fl||rd||cd)) 
           color = BLACK;
-        if (i >= 4 && i < 54 && !(fl||rd)) 
+        if (i >= 2 && i < 54 && !(fl||rd)) 
           color = BLACK;
-        if (i >= 54 && i < 104 && !(fl||rs)) 
+        if (i >= 54 && i < 106 && !(fl||rs)) 
           color = BLACK;
-        if (i >= 104 && i < 108 && !(fl||rs||cs)) 
+        if (i >= 106 && i < 108 && !(fl||rs||cs)) 
+          color = BLACK;
+        if (do_blink_blink % 2 == 1)
           color = BLACK;
 
         strip.setPixelColor(i, color);
@@ -124,7 +138,8 @@ class BedLampUsermod : public Usermod {
      * Returning true will prevent button working in a default way.
      * Replicating button.cpp
      */
-    bool handleButton(uint8_t b) {
+    bool handleButton(uint8_t b)
+    {
       yield();
       // ignore certain button types as they may have other consequences
       if (!enabled
@@ -143,6 +158,8 @@ class BedLampUsermod : public Usermod {
         // momentary button logic
         if (isButtonPressed(b))  // pressed
         {
+          nightlightStartTime = millis(); // reset nightlight timer at each interaction with the buttons
+
           if (!buttonPressedBefore[b])
             OnRisingEdge(b);
 
@@ -153,7 +170,7 @@ class BedLampUsermod : public Usermod {
           {
             if (!buttonLongPressed[b]) //first action
             {
-              OnLongPress(b);
+              OnLongPressBegin(b);
             }
             else //repeatable action
             { 
@@ -169,7 +186,7 @@ class BedLampUsermod : public Usermod {
           long dur = now - buttonPressedTime[b];
 
           // released after rising-edge short press action
-          if (macroButton[b] && macroButton[b] == macroLongPress[b] && macroButton[b] == macroDoublePress[b]) {
+          if (false /*macroButton[b] && macroButton[b] == macroLongPress[b] && macroButton[b] == macroDoublePress[b]*/) {
             if (dur > WLED_DEBOUNCE_THRESHOLD) buttonPressedBefore[b] = false; // debounce, blocks button for 50 ms once it has been released
             return true;
           }
@@ -181,7 +198,7 @@ class BedLampUsermod : public Usermod {
           if (!buttonLongPressed[b])  //short press
           {
             //NOTE: this interferes with double click handling in usermods so usermod needs to implement full button handling
-            if (b != 1 && !macroDoublePress[b]) { //don't wait for double press on buttons without a default action if no double press macro set
+            if (b != 1 && false/*!macroDoublePress[b]*/) { //don't wait for double press on buttons without a default action if no double press macro set
               OnShortPress(b);
             } else { //double press if less than 350 ms between current press and previous short press release (buttonWaitTime!=0)
               if (doublePress) {
@@ -190,6 +207,10 @@ class BedLampUsermod : public Usermod {
                 buttonWaitTime[b] = now;
               }
             }
+          }
+          else
+          {
+            OnLongPressEnd(b);              
           }
           buttonPressedBefore[b] = false;
           buttonLongPressed[b] = false;
@@ -211,13 +232,14 @@ class BedLampUsermod : public Usermod {
 
     void OnRisingEdge(uint8_t b)
     {
-      if (IsPirButton(b) && IsLampOffOrCourtesy() && IsSleepHours())
+      if (IsPirButton(b) && IsLampOffOrCourtesy() && IsSleepHours() && IsDark())
       {
         Serial.printf("Rising Edge %d\n", b);
         uint32_t new_status = current_status;
+        ClearBit(new_status, STA_TURNING_OFF);
         if (b == BTN_PIR_DX) SetBit(new_status, STA_COURTESY_DX);
         if (b == BTN_PIR_SX) SetBit(new_status, STA_COURTESY_SX);
-        SetStatus(new_status, 1);
+        SetStatus(new_status, BRI_COURTESY, 1);
       }
     }
     void OnShortPress(uint8_t b)
@@ -230,14 +252,15 @@ class BedLampUsermod : public Usermod {
         {
           uint32_t new_status = current_status;
           SetBit(new_status, STA_TURNING_OFF);
-          SetStatus(new_status, 0);
+          SetStatus(new_status, BRI_OFF, 0);
         }
         else
         {
           uint32_t new_status = current_status;
+          ClearBit(new_status, STA_TURNING_OFF);
           if (b == BTN_TOUCH_DX) SetBit(new_status, STA_READING_DX);
           if (b == BTN_TOUCH_SX) SetBit(new_status, STA_READING_SX);
-          SetStatus(new_status, 60);
+          SetStatus(new_status, BRI_READING, 60);
         }
       }
     }
@@ -246,19 +269,25 @@ class BedLampUsermod : public Usermod {
       if (IsTouchButton(b))
       {
         Serial.printf("Double Click %d\n", b);
-        SetStatus(STA_FULL_LAMP, 60);
+        SetStatus(STA_FULL_LAMP, BRI_FULL, 60);
       }
     }
-    void OnLongPress(uint8_t b)
+    void OnLongPressBegin(uint8_t b)
     {
       if (IsTouchButton(b))
       {
-        Serial.printf("LongPress %d\n", b);
-        fade_up = !fade_up; //invert direction at each change, starting with fade up
+        Serial.printf("LongPress BGN %d\n", b);
+        
         if (IsLampTotallyOff())
-          OnShortPress(b);
+        {
+          OnShortPress(b); //if we are off, turn on doing the same action as a click
+          OnFadeBegin(); //set fast transition delay and starting brightness (using the one set by OnShortPress)
+        }
         else
-          FadeBrightness();
+        {
+          OnFadeBegin(); //set fast transition delay and starting brightness (using the current one)
+          FadeBrightness(); //if we are already on, start dimming
+        }
       }
     }
     void OnLongPressRepeat(uint8_t b)
@@ -266,30 +295,58 @@ class BedLampUsermod : public Usermod {
       if (IsTouchButton(b))
       {
         Serial.printf("LongPress RPT %d\n", b);
-        FadeBrightness();
+
+        FadeBrightness(); //keep dimming
       }
+    }
+    void OnLongPressEnd(uint8_t b)
+    {
+      if (IsTouchButton(b))
+      {
+        Serial.printf("LongPress END %d\n", b);
+
+        OnFadeEnd(); //restore original transition delay and nightlight status
+        fade_up = !fade_up;  //invert direction
+      }
+    }
+
+    void OnFadeBegin()
+    {
+      targetFadeBri = bri; //the brightness we are starting from
+
+      // set to a fast transition delay to have a smooth dimming effect
+      originalTransitionDelay = transitionDelay;
+      transitionDelay = WLED_LONG_REPEATED_ACTION-10;
+      strip.setTransition(transitionDelay);
+    }
+
+    void OnFadeEnd()
+    {
+      // restore original transition delay
+      transitionDelay = originalTransitionDelay;
+      originalTransitionDelay = 0;
+      strip.setTransition(transitionDelay);
     }
 
     void FadeBrightness()
     {
-      byte nbri = bri;
+      byte old = targetFadeBri;
 
       if (fade_up) //up
-        nbri = MIN(255, bri + 8);
+        targetFadeBri = MIN(BRI_MAX, (targetFadeBri + 8) / 8 * 8 );
       else if (!fade_up) //down
-        nbri = MAX(10, bri - 8);
+        targetFadeBri = MAX(BRI_MIN, (targetFadeBri - 8) / 8 * 8);
 
-      if (nbri != bri)
+      if (targetFadeBri != old)
       {
         lastFadeTime = millis();
-        bri = nbri;
-        if (originalTransitionDelay == 0)
-        {
-          originalTransitionDelay = transitionDelay;
-          transitionDelay = WLED_LONG_REPEATED_ACTION;
-          strip.setTransition(transitionDelay);
-        }
-        Serial.printf("Brightness: %d\n", bri);
+
+        if (do_blink_blink == 0 && (targetFadeBri == BRI_MIN || targetFadeBri == BRI_MAX)) //siamo appena arrivati in fondo o in cima
+          do_blink_blink = 1; //trigger the blink-blink
+
+        bri = targetFadeBri;
+
+        Serial.printf("Brightness change: %d -> %d\n", old, targetFadeBri);
         stateUpdated(CALL_MODE_DIRECT_CHANGE);
       }
     }
@@ -311,6 +368,9 @@ class BedLampUsermod : public Usermod {
 
       return (curp && !oldp); // this is the rising edge
     }
+
+    bool IsDark()
+    { return true; }
 
     bool IsSleepHours()
     {
@@ -334,42 +394,79 @@ class BedLampUsermod : public Usermod {
       return IsLampTotallyOff() || current_status == STA_COURTESY_DX || current_status == STA_COURTESY_SX || current_status == (STA_COURTESY_DX | STA_COURTESY_SX);
     }
 
-    void SetStatus(uint32_t new_status, uint32_t timeout)
+    void SetStatus(uint32_t new_status, uint8_t brightness, uint32_t timeout)
     {
-      if (new_status != current_status || !incontrol)
+      //new_status = STA_COURTESY_DX;
+      
+      if (new_status != current_status)
       {
-        lastCommandTime = millis();
-
-        if (!incontrol)
+        if (new_status == STA_WLED_HANDLE)  
+        {
+          Serial.println("    > Now Handled by WLED");
+        }
+        else
         {
           Serial.println("    > Now Handled by BedLamp");
-          incontrol = true;
-        }
 
-        Serial.printf("    > New Status: %x\n", new_status);
-        current_status = new_status;
+          lastStatusChangeTime = millis();
 
-        if (TestBit(current_status, STA_TURNING_OFF)) //abbiamo la richiesta di spegnimento
-        {
-          briLast = bri;
-          bri = 0;
-          nightlightActive = false;
-          nightlightDelayMins = 0;
-        }
-        else //siamo accesi o in accensione
-        {
-          if (timeout > 0)
-          {
-            nightlightActive = true;
-            nightlightDelayMins = timeout;
-            nightlightStartTime = millis();
-          }
+          if (TestBit(new_status, STA_TURNING_OFF)) //abbiamo la richiesta di spegnimento
+          { briLast = bri; bri = 0; }
+          else //siamo accesi o in accensione
+          { bri = brightness; } // turn on at requested brightness
 
-          bri = WLED_DEFAULT_BRIGHTNESS; // turn on at default brightness
+          nightlightActive = timeout > 0;
+          nightlightDelayMins = timeout;
+          
+          stateUpdated(CALL_MODE_DIRECT_CHANGE);
         }
         
-        stateUpdated(CALL_MODE_DIRECT_CHANGE);
+        PrintNewStatus(new_status);
+        current_status = new_status;
       }
+    }
+
+    void PrintNewStatus(int new_status) 
+    {
+        String statusDescription = "    > New Status: ";
+        bool first = true;
+        
+        if (TestBit(new_status, STA_COURTESY_DX)) {
+            if (!first) statusDescription += ", ";
+            statusDescription += "COURTESY_DX";
+            first = false;
+        }
+        if (TestBit(new_status, STA_COURTESY_SX)) {
+            if (!first) statusDescription += ", ";
+            statusDescription += "COURTESY_SX";
+            first = false;
+        }
+        if (TestBit(new_status, STA_READING_DX)) {
+            if (!first) statusDescription += ", ";
+            statusDescription += "READING_DX";
+            first = false;
+        }
+        if (TestBit(new_status, STA_READING_SX)) {
+            if (!first) statusDescription += ", ";
+            statusDescription += "READING_SX";
+            first = false;
+        }
+        if (TestBit(new_status, STA_FULL_LAMP)) {
+            if (!first) statusDescription += ", ";
+            statusDescription += "FULL_LAMP";
+            first = false;
+        }
+        if (TestBit(new_status, STA_TURNING_OFF)) {
+            if (!first) statusDescription += ", ";
+            statusDescription += "TURNING_OFF";
+            first = false;
+        }
+        
+        if (statusDescription == "    > New Status: ") {
+            statusDescription += "WLED_HANDLE";
+        }
+        
+        Serial.println(statusDescription);
     }
 
     bool TestBit(uint32_t value, uint8_t bit)
